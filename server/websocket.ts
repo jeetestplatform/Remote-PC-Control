@@ -21,7 +21,8 @@ export function setupWebSocket(server: Server) {
   };
 
   wss.on('connection', (ws) => {
-    let currentDeviceId: string | null = null;
+    let primaryDeviceId: string | null = null;
+    const boundDeviceIds = new Set<string>();
     let currentConnectionSessionId: number | null = null;
 
     const recordConnectionStarted = async (deviceId: string) => {
@@ -53,11 +54,11 @@ export function setupWebSocket(server: Server) {
             SET disconnected_at = NOW(), close_reason = ${reason}
             WHERE id = ${currentConnectionSessionId} AND disconnected_at IS NULL
           `);
-        } else if (currentDeviceId) {
+        } else if (primaryDeviceId) {
           await db.execute(sql`
             UPDATE connection_sessions
             SET disconnected_at = NOW(), close_reason = ${reason}
-            WHERE device_id = ${currentDeviceId} AND disconnected_at IS NULL
+            WHERE device_id = ${primaryDeviceId} AND disconnected_at IS NULL
           `);
         }
       } catch (err) {
@@ -82,6 +83,11 @@ export function setupWebSocket(server: Server) {
       });
     };
 
+    const bindDeviceId = (deviceId: string) => {
+      connectedDevices.set(deviceId, ws);
+      boundDeviceIds.add(deviceId);
+    };
+
     ws.on('message', async (data) => {
       try {
         const message = JSON.parse(data.toString()) as any;
@@ -89,7 +95,7 @@ export function setupWebSocket(server: Server) {
 
         if (targetDeviceId) {
           const payload = message?.payload ?? message?.Payload;
-          const sourceDeviceId = getStringField(message, 'sourceDeviceId', 'SourceDeviceId') ?? currentDeviceId;
+          const sourceDeviceId = getStringField(message, 'sourceDeviceId', 'SourceDeviceId') ?? primaryDeviceId;
           const outgoingType = getStringField(message, 'type', 'Type') ?? 'command';
 
           const targetWs = connectedDevices.get(targetDeviceId);
@@ -115,12 +121,12 @@ export function setupWebSocket(server: Server) {
         if (message && typeof message.command === 'string') {
           const forwarded = {
             type: 'command',
-            sourceDeviceId: currentDeviceId,
+            sourceDeviceId: primaryDeviceId,
             payload: message,
           };
 
           connectedDevices.forEach((targetWs, deviceId) => {
-            if (deviceId === currentDeviceId) {
+            if (deviceId === primaryDeviceId) {
               return;
             }
 
@@ -145,8 +151,21 @@ export function setupWebSocket(server: Server) {
               }));
               break;
             }
-            currentDeviceId = deviceId;
-            connectedDevices.set(deviceId, ws);
+
+            if (!primaryDeviceId) {
+              primaryDeviceId = deviceId;
+            }
+
+            bindDeviceId(deviceId);
+
+            const aliasCandidates = Array.isArray(payload?.aliases)
+              ? payload.aliases.filter((x: unknown) => typeof x === 'string').map((x: string) => x.trim()).filter(Boolean)
+              : [];
+
+            for (const alias of aliasCandidates) {
+              bindDeviceId(alias);
+            }
+
             await storage.updateDeviceStatus(deviceId, 'online');
             await recordConnectionStarted(deviceId);
             broadcastDeviceStatus(deviceId, 'online');
@@ -181,16 +200,19 @@ export function setupWebSocket(server: Server) {
     });
 
     ws.on('close', async () => {
-      if (currentDeviceId) {
-        connectedDevices.delete(currentDeviceId);
+      for (const id of boundDeviceIds) {
+        connectedDevices.delete(id);
+      }
+
+      if (primaryDeviceId) {
         try {
-          await storage.updateDeviceStatus(currentDeviceId, 'offline');
+          await storage.updateDeviceStatus(primaryDeviceId, 'offline');
           await recordConnectionEnded('socket_closed');
-          broadcastDeviceStatus(currentDeviceId, 'offline');
+          broadcastDeviceStatus(primaryDeviceId, 'offline');
         } catch (err) {
           console.error('Failed to update device status on disconnect:', err);
         }
-        console.log(`Device ${currentDeviceId} disconnected`);
+        console.log(`Device ${primaryDeviceId} disconnected`);
       }
     });
 
