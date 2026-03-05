@@ -55,4 +55,14 @@ export async function ensureDatabaseSchema(): Promise<void> {
       expires_at TIMESTAMP NOT NULL
     )
   `);
+
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS connection_sessions (
+      id SERIAL PRIMARY KEY,
+      device_id TEXT NOT NULL,
+      connected_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      disconnected_at TIMESTAMP,
+      close_reason TEXT
+    )
+  `);
 }
