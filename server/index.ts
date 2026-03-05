@@ -1,6 +1,5 @@
 import express, { type Request, Response, NextFunction } from "express";
 import { registerRoutes } from "./routes";
-import { serveStatic } from "./static";
 import { createServer } from "http";
 import { ensureDatabaseSchema } from "./db";
 
@@ -77,14 +76,16 @@ app.use((req, res, next) => {
     return res.status(status).json({ message });
   });
 
-  // importantly only setup vite in development and after
-  // setting up all the other routes so the catch-all route
-  // doesn't interfere with the other routes
-  if (process.env.NODE_ENV === "production") {
-    serveStatic(app);
-  } else {
+  if (process.env.NODE_ENV !== "production") {
     const { setupVite } = await import("./vite");
     await setupVite(httpServer, app);
+  } else {
+    app.get("/", (_req, res) => {
+      res.status(200).json({
+        status: "ok",
+        message: "Backend server is running",
+      });
+    });
   }
 
   // ALWAYS serve the app on the port specified in the environment variable PORT
