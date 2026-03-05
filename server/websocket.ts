@@ -9,26 +9,43 @@ const connectedDevices = new Map<string, WebSocket>();
 export function setupWebSocket(server: Server) {
   const wss = new WebSocketServer({ server, path: '/ws' });
 
+  const getStringField = (obj: any, ...keys: string[]): string | null => {
+    for (const key of keys) {
+      if (obj && typeof obj[key] === 'string' && obj[key].trim().length > 0) {
+        return obj[key];
+      }
+    }
+    return null;
+  };
+
   wss.on('connection', (ws) => {
     let currentDeviceId: string | null = null;
 
     ws.on('message', async (data) => {
       try {
         const message = JSON.parse(data.toString()) as any;
+        const targetDeviceId = getStringField(message, 'targetDeviceId', 'TargetDeviceId');
 
-        if (message && typeof message.targetDeviceId === 'string') {
-          const targetWs = connectedDevices.get(message.targetDeviceId);
+        if (targetDeviceId) {
+          const payload = message?.payload ?? message?.Payload;
+          const sourceDeviceId = getStringField(message, 'sourceDeviceId', 'SourceDeviceId') ?? currentDeviceId;
+          const outgoingType = getStringField(message, 'type', 'Type') ?? 'command';
+
+          const targetWs = connectedDevices.get(targetDeviceId);
 
           if (targetWs && targetWs.readyState === WebSocket.OPEN) {
             const forwarded = {
               ...message,
-              sourceDeviceId: typeof message.sourceDeviceId === 'string' ? message.sourceDeviceId : currentDeviceId,
+              type: outgoingType,
+              targetDeviceId,
+              sourceDeviceId,
+              payload,
             };
             targetWs.send(JSON.stringify(forwarded));
           } else {
             ws.send(JSON.stringify({
               type: 'error',
-              payload: { message: `Target device ${message.targetDeviceId} is offline` }
+              payload: { message: `Target device ${targetDeviceId} is offline` }
             }));
           }
           return;
@@ -58,7 +75,15 @@ export function setupWebSocket(server: Server) {
         
         switch (typedMessage.type) {
           case WS_EVENTS.REGISTER: {
-            const { deviceId } = typedMessage.payload as { deviceId: string };
+            const payload = typedMessage.payload as any;
+            const deviceId = getStringField(payload, 'deviceId', 'DeviceId');
+            if (!deviceId) {
+              ws.send(JSON.stringify({
+                type: 'error',
+                payload: { message: 'Missing deviceId in register payload' }
+              }));
+              break;
+            }
             currentDeviceId = deviceId;
             connectedDevices.set(deviceId, ws);
             await storage.updateDeviceStatus(deviceId, 'online');
