@@ -20,10 +20,24 @@ export function setupWebSocket(server: Server) {
     return null;
   };
 
+  // Keep-alive: send ping to all connected clients every 30 seconds
+  setInterval(() => {
+    connectedDevices.forEach((ws) => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.ping();
+      }
+    });
+  }, 30_000);  // 30 seconds
+
   wss.on('connection', (ws) => {
     let primaryDeviceId: string | null = null;
     const boundDeviceIds = new Set<string>();
     let currentConnectionSessionId: number | null = null;
+
+    // Handle pong responses from client
+    ws.on('pong', () => {
+      // Connection is still active
+    });
 
     const recordConnectionStarted = async (deviceId: string) => {
       try {

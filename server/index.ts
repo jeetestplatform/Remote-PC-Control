@@ -1,7 +1,8 @@
 import express, { type Request, Response, NextFunction } from "express";
 import { registerRoutes } from "./routes";
 import { createServer } from "http";
-import { ensureDatabaseSchema } from "./db";
+import { ensureDatabaseSchema, db } from "./db";
+import { sql } from "drizzle-orm";
 
 const app = express();
 const httpServer = createServer(app);
@@ -105,6 +106,33 @@ app.use((req, res, next) => {
   if (process.platform !== "win32") {
     listenOptions.reusePort = true;
   }
+
+  // Start periodic cleanup of expired sessions (every hour)
+  setInterval(async () => {
+    try {
+      await db.execute(sql`
+        DELETE FROM sessions
+        WHERE expires_at < NOW()
+      `);
+      log("Cleaned up expired sessions");
+    } catch (err) {
+      console.error("Failed to clean up expired sessions:", err);
+    }
+  }, 60 * 60 * 1000);  // Run every hour
+
+  // Also cleanup old connection session logs (keep last 30 days)
+  setInterval(async () => {
+    try {
+      await db.execute(sql`
+        DELETE FROM connection_sessions
+        WHERE disconnected_at IS NOT NULL
+        AND disconnected_at < NOW() - INTERVAL '30 days'
+      `);
+      log("Cleaned up old connection session logs");
+    } catch (err) {
+      console.error("Failed to clean up connection session logs:", err);
+    }
+  }, 24 * 60 * 60 * 1000);  // Run every 24 hours
 
   httpServer.listen(
     listenOptions,
