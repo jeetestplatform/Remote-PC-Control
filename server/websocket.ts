@@ -192,8 +192,10 @@ export function setupWebSocket(server: Server) {
           case WS_EVENTS.OFFER:
           case WS_EVENTS.ANSWER:
           case WS_EVENTS.ICE_CANDIDATE:
-          case WS_EVENTS.CONNECTION_REQUEST: {
-            // Forward signaling messages to target device
+          case WS_EVENTS.CONNECTION_REQUEST:
+          case WS_EVENTS.SCREEN_SHARE_START:
+          case WS_EVENTS.SCREEN_SHARE_STOP: {
+            // Forward signaling messages and screen share commands to target device
             const { targetDeviceId } = typedMessage.payload as { targetDeviceId: string };
             const targetWs = connectedDevices.get(targetDeviceId);
             

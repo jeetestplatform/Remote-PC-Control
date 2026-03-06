@@ -54,7 +54,9 @@ export const WS_EVENTS = {
   ANSWER: 'answer',
   ICE_CANDIDATE: 'ice-candidate',
   CONNECTION_REQUEST: 'connection-request',
-  DEVICE_STATUS: 'device-status'
+  DEVICE_STATUS: 'device-status',
+  SCREEN_SHARE_START: 'screen-share-start',
+  SCREEN_SHARE_STOP: 'screen-share-stop'
 } as const;
 
 export interface WsMessage<T = any> {
