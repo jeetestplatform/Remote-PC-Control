@@ -7,6 +7,7 @@ import { sql } from 'drizzle-orm';
 
 // Maps deviceId to WebSocket connection
 const connectedDevices = new Map<string, WebSocket>();
+const socketPrimaryDeviceIds = new Map<WebSocket, string>();
 
 export function setupWebSocket(server: Server) {
   const wss = new WebSocketServer({ server, path: '/ws' });
@@ -102,6 +103,23 @@ export function setupWebSocket(server: Server) {
       boundDeviceIds.add(deviceId);
     };
 
+    const sendOnlineSnapshotToCurrentSocket = (registeredDeviceId: string) => {
+      socketPrimaryDeviceIds.forEach((peerDeviceId, peerSocket) => {
+        if (peerDeviceId === registeredDeviceId || peerSocket === ws) {
+          return;
+        }
+
+        if (peerSocket.readyState !== WebSocket.OPEN) {
+          return;
+        }
+
+        ws.send(JSON.stringify({
+          type: WS_EVENTS.DEVICE_STATUS,
+          payload: { deviceId: peerDeviceId, status: 'online' }
+        }));
+      });
+    };
+
     ws.on('message', async (data) => {
       try {
         const message = JSON.parse(data.toString()) as any;
@@ -153,6 +171,17 @@ export function setupWebSocket(server: Server) {
         }
 
         const typedMessage = message as WsMessage;
+
+        if (getStringField(typedMessage, 'type', 'Type')?.toLowerCase() === 'ping') {
+          ws.send(JSON.stringify({
+            type: 'pong',
+            payload: {
+              timestamp: Date.now(),
+              deviceId: primaryDeviceId
+            }
+          }));
+          return;
+        }
         
         switch (typedMessage.type) {
           case WS_EVENTS.REGISTER: {
@@ -170,6 +199,8 @@ export function setupWebSocket(server: Server) {
               primaryDeviceId = deviceId;
             }
 
+            socketPrimaryDeviceIds.set(ws, deviceId);
+
             bindDeviceId(deviceId);
 
             const aliasCandidates = Array.isArray(payload?.aliases)
@@ -183,6 +214,7 @@ export function setupWebSocket(server: Server) {
             await storage.updateDeviceStatus(deviceId, 'online');
             await recordConnectionStarted(deviceId);
             broadcastDeviceStatus(deviceId, 'online');
+            sendOnlineSnapshotToCurrentSocket(deviceId);
             
             // Broadcast status change to peers/dashboard
             console.log(`Device ${deviceId} registered via WS`);
@@ -230,6 +262,8 @@ export function setupWebSocket(server: Server) {
         }
         console.log(`Device ${primaryDeviceId} disconnected`);
       }
+
+      socketPrimaryDeviceIds.delete(ws);
     });
 
     ws.on('error', async (err) => {
