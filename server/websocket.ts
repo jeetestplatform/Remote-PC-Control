@@ -8,6 +8,8 @@ import { sql } from 'drizzle-orm';
 // Maps deviceId to WebSocket connection
 const connectedDevices = new Map<string, WebSocket>();
 const socketPrimaryDeviceIds = new Map<WebSocket, string>();
+const readyMobileDevices = new Set<string>();
+const pendingClipboardByDevice = new Map<string, string[]>();
 
 export function setupWebSocket(server: Server) {
   const wss = new WebSocketServer({ server, path: '/ws' });
@@ -103,6 +105,58 @@ export function setupWebSocket(server: Server) {
       boundDeviceIds.add(deviceId);
     };
 
+    const isClipboardForward = (payload: any): boolean => {
+      const command = getStringField(payload, 'command', 'Command');
+      return !!command && (command.toLowerCase() === 'clipboard.sync' || command.toLowerCase() === 'clipboard');
+    };
+
+    const enqueuePendingClipboard = (targetDeviceId: string, messageText: string) => {
+      const queue = pendingClipboardByDevice.get(targetDeviceId) ?? [];
+      queue.push(messageText);
+      if (queue.length > 10) {
+        queue.shift();
+      }
+      pendingClipboardByDevice.set(targetDeviceId, queue);
+    };
+
+    const flushPendingClipboard = (targetDeviceId: string) => {
+      const queue = pendingClipboardByDevice.get(targetDeviceId);
+      if (!queue || queue.length === 0) {
+        return;
+      }
+
+      const targetWs = connectedDevices.get(targetDeviceId);
+      if (!targetWs || targetWs.readyState !== WebSocket.OPEN) {
+        return;
+      }
+
+      while (queue.length > 0) {
+        const next = queue.shift();
+        if (next) {
+          console.log(`[SERVER] broadcasting clipboard to 1 devices`);
+          targetWs.send(next);
+        }
+      }
+      pendingClipboardByDevice.delete(targetDeviceId);
+    };
+
+    const broadcastDeviceReady = (deviceId: string, ready: boolean) => {
+      const readyMessage = JSON.stringify({
+        type: 'device-ready',
+        payload: { deviceId, ready }
+      });
+
+      connectedDevices.forEach((peerSocket, peerDeviceId) => {
+        if (peerDeviceId === deviceId) {
+          return;
+        }
+
+        if (peerSocket.readyState === WebSocket.OPEN) {
+          peerSocket.send(readyMessage);
+        }
+      });
+    };
+
     const sendOnlineSnapshotToCurrentSocket = (registeredDeviceId: string) => {
       socketPrimaryDeviceIds.forEach((peerDeviceId, peerSocket) => {
         if (peerDeviceId === registeredDeviceId || peerSocket === ws) {
@@ -131,6 +185,7 @@ export function setupWebSocket(server: Server) {
           const outgoingType = getStringField(message, 'type', 'Type') ?? 'command';
 
           const targetWs = connectedDevices.get(targetDeviceId);
+          const isClipboardMessage = isClipboardForward(payload);
 
           if (targetWs && targetWs.readyState === WebSocket.OPEN) {
             const forwarded = {
@@ -140,12 +195,32 @@ export function setupWebSocket(server: Server) {
               sourceDeviceId,
               payload,
             };
-            targetWs.send(JSON.stringify(forwarded));
+            const forwardedText = JSON.stringify(forwarded);
+
+            if (isClipboardMessage && !readyMobileDevices.has(targetDeviceId)) {
+              enqueuePendingClipboard(targetDeviceId, forwardedText);
+            } else {
+              if (isClipboardMessage) {
+                console.log(`[SERVER] broadcasting clipboard to 1 devices`);
+              }
+              targetWs.send(forwardedText);
+            }
           } else {
-            ws.send(JSON.stringify({
-              type: 'error',
-              payload: { message: `Target device ${targetDeviceId} is offline` }
-            }));
+            if (isClipboardMessage) {
+              const forwarded = {
+                ...message,
+                type: outgoingType,
+                targetDeviceId,
+                sourceDeviceId,
+                payload,
+              };
+              enqueuePendingClipboard(targetDeviceId, JSON.stringify(forwarded));
+            } else {
+              ws.send(JSON.stringify({
+                type: 'error',
+                payload: { message: `Target device ${targetDeviceId} is offline` }
+              }));
+            }
           }
           return;
         }
@@ -171,8 +246,20 @@ export function setupWebSocket(server: Server) {
         }
 
         const typedMessage = message as WsMessage;
+        const incomingType = getStringField(typedMessage, 'type', 'Type')?.toLowerCase();
 
-        if (getStringField(typedMessage, 'type', 'Type')?.toLowerCase() === 'ping') {
+        if (incomingType === 'client_ready' || incomingType === 'client.ready') {
+          const readyDeviceId = getStringField((typedMessage as any).payload, 'deviceId', 'DeviceId') || primaryDeviceId;
+          if (readyDeviceId) {
+            readyMobileDevices.add(readyDeviceId);
+            console.log(`[SERVER] mobile ready ${readyDeviceId}`);
+            broadcastDeviceReady(readyDeviceId, true);
+            flushPendingClipboard(readyDeviceId);
+          }
+          return;
+        }
+
+        if (incomingType === 'ping') {
           ws.send(JSON.stringify({
             type: 'pong',
             payload: {
@@ -215,6 +302,9 @@ export function setupWebSocket(server: Server) {
             await recordConnectionStarted(deviceId);
             broadcastDeviceStatus(deviceId, 'online');
             sendOnlineSnapshotToCurrentSocket(deviceId);
+            readyMobileDevices.delete(deviceId);
+            pendingClipboardByDevice.delete(deviceId);
+            console.log(`[SERVER] mobile connected ${deviceId}`);
             
             // Broadcast status change to peers/dashboard
             console.log(`Device ${deviceId} registered via WS`);
@@ -250,12 +340,15 @@ export function setupWebSocket(server: Server) {
     ws.on('close', async () => {
       for (const id of boundDeviceIds) {
         connectedDevices.delete(id);
+        readyMobileDevices.delete(id);
+        pendingClipboardByDevice.delete(id);
       }
 
       if (primaryDeviceId) {
         try {
           await storage.updateDeviceStatus(primaryDeviceId, 'offline');
           await recordConnectionEnded('socket_closed');
+          broadcastDeviceReady(primaryDeviceId, false);
           broadcastDeviceStatus(primaryDeviceId, 'offline');
         } catch (err) {
           console.error('Failed to update device status on disconnect:', err);
