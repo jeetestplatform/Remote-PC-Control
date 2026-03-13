@@ -10,6 +10,7 @@ const connectedDevices = new Map<string, WebSocket>();
 const socketPrimaryDeviceIds = new Map<WebSocket, string>();
 const readyMobileDevices = new Set<string>();
 const pendingClipboardByDevice = new Map<string, string[]>();
+const devicePlatforms = new Map<string, string>();
 
 export function setupWebSocket(server: Server) {
   const wss = new WebSocketServer({ server, path: '/ws' });
@@ -186,6 +187,8 @@ export function setupWebSocket(server: Server) {
 
           const targetWs = connectedDevices.get(targetDeviceId);
           const isClipboardMessage = isClipboardForward(payload);
+          const targetPlatform = (devicePlatforms.get(targetDeviceId) ?? '').toLowerCase();
+          const targetRequiresReady = targetPlatform === 'android' || targetDeviceId.toLowerCase().startsWith('android-');
 
           if (targetWs && targetWs.readyState === WebSocket.OPEN) {
             const forwarded = {
@@ -197,7 +200,7 @@ export function setupWebSocket(server: Server) {
             };
             const forwardedText = JSON.stringify(forwarded);
 
-            if (isClipboardMessage && !readyMobileDevices.has(targetDeviceId)) {
+            if (isClipboardMessage && targetRequiresReady && !readyMobileDevices.has(targetDeviceId)) {
               enqueuePendingClipboard(targetDeviceId, forwardedText);
             } else {
               if (isClipboardMessage) {
@@ -206,7 +209,7 @@ export function setupWebSocket(server: Server) {
               targetWs.send(forwardedText);
             }
           } else {
-            if (isClipboardMessage) {
+            if (isClipboardMessage && targetRequiresReady) {
               const forwarded = {
                 ...message,
                 type: outgoingType,
@@ -286,6 +289,9 @@ export function setupWebSocket(server: Server) {
               primaryDeviceId = deviceId;
             }
 
+            const platform = getStringField(payload, 'platform', 'Platform')?.toLowerCase() ?? 'unknown';
+            devicePlatforms.set(deviceId, platform);
+
             socketPrimaryDeviceIds.set(ws, deviceId);
 
             bindDeviceId(deviceId);
@@ -296,6 +302,7 @@ export function setupWebSocket(server: Server) {
 
             for (const alias of aliasCandidates) {
               bindDeviceId(alias);
+              devicePlatforms.set(alias, platform);
             }
 
             await storage.updateDeviceStatus(deviceId, 'online');
@@ -342,6 +349,7 @@ export function setupWebSocket(server: Server) {
         connectedDevices.delete(id);
         readyMobileDevices.delete(id);
         pendingClipboardByDevice.delete(id);
+        devicePlatforms.delete(id);
       }
 
       if (primaryDeviceId) {
