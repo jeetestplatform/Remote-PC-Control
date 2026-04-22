@@ -11,9 +11,16 @@ const socketPrimaryDeviceIds = new Map<WebSocket, string>();
 const readyMobileDevices = new Set<string>();
 const pendingClipboardByDevice = new Map<string, string[]>();
 const devicePlatforms = new Map<string, string>();
+const lastPongAtBySocket = new WeakMap<WebSocket, number>();
+const PING_INTERVAL_MS = 30_000;
+const SOCKET_STALE_TIMEOUT_MS = 120_000;
 
 export function setupWebSocket(server: Server) {
   const wss = new WebSocketServer({ server, path: '/ws' });
+
+  const markSocketAlive = (socket: WebSocket) => {
+    lastPongAtBySocket.set(socket, Date.now());
+  };
 
   const getStringField = (obj: any, ...keys: string[]): string | null => {
     for (const key of keys) {
@@ -24,23 +31,59 @@ export function setupWebSocket(server: Server) {
     return null;
   };
 
-  // Keep-alive: send ping to all connected clients every 30 seconds
-  setInterval(() => {
+  // Keep-alive: ping all connected clients and terminate stale sockets.
+  const keepAliveTimer = setInterval(() => {
+    const now = Date.now();
+    const uniqueSockets = new Set<WebSocket>();
+
     connectedDevices.forEach((ws) => {
-      if (ws.readyState === WebSocket.OPEN) {
+      uniqueSockets.add(ws);
+    });
+
+    uniqueSockets.forEach((ws) => {
+      if (ws.readyState !== WebSocket.OPEN) {
+        return;
+      }
+
+      const deviceId = socketPrimaryDeviceIds.get(ws) ?? 'unknown-device';
+      const lastPongAt = lastPongAtBySocket.get(ws) ?? now;
+      if (now - lastPongAt > SOCKET_STALE_TIMEOUT_MS) {
+        console.warn(`[SERVER] terminating stale websocket for ${deviceId} (${now - lastPongAt}ms without pong)`);
+        try {
+          ws.terminate();
+        } catch {
+          // ignore
+        }
+        return;
+      }
+
+      try {
         ws.ping();
+      } catch (err) {
+        console.error(`[SERVER] ping failed for ${deviceId}`, err);
+        try {
+          ws.terminate();
+        } catch {
+          // ignore
+        }
       }
     });
-  }, 30_000);  // 30 seconds
+  }, PING_INTERVAL_MS);
+
+  wss.on('close', () => {
+    clearInterval(keepAliveTimer);
+  });
 
   wss.on('connection', (ws) => {
+    markSocketAlive(ws);
+
     let primaryDeviceId: string | null = null;
     const boundDeviceIds = new Set<string>();
     let currentConnectionSessionId: number | null = null;
 
     // Handle pong responses from client
     ws.on('pong', () => {
-      // Connection is still active
+      markSocketAlive(ws);
     });
 
     const recordConnectionStarted = async (deviceId: string) => {
@@ -102,13 +145,60 @@ export function setupWebSocket(server: Server) {
     };
 
     const bindDeviceId = (deviceId: string) => {
+      const existingSocket = connectedDevices.get(deviceId);
+      if (existingSocket && existingSocket !== ws) {
+        console.warn(`[SERVER] replacing existing websocket binding for ${deviceId}`);
+        try {
+          existingSocket.close(4001, 'replaced-by-new-connection');
+        } catch {
+          // ignore
+        }
+      }
+
       connectedDevices.set(deviceId, ws);
       boundDeviceIds.add(deviceId);
+    };
+
+    const unbindDeviceIdIfOwnedByCurrentSocket = (deviceId: string): boolean => {
+      const current = connectedDevices.get(deviceId);
+      if (current !== ws) {
+        return false;
+      }
+
+      connectedDevices.delete(deviceId);
+      return true;
     };
 
     const isClipboardForward = (payload: any): boolean => {
       const command = getStringField(payload, 'command', 'Command');
       return !!command && (command.toLowerCase() === 'clipboard.sync' || command.toLowerCase() === 'clipboard');
+    };
+
+    const isClipboardSyncState = (payload: any): boolean => {
+      const command = getStringField(payload, 'command', 'Command');
+      return !!command && command.toLowerCase() === 'clipboard.sync.state';
+    };
+
+    const getClipboardSyncStateEnabled = (payload: any): boolean | null => {
+      const innerPayload = payload?.payload ?? payload?.Payload;
+      const value = innerPayload?.enabled ?? innerPayload?.Enabled;
+
+      if (typeof value === 'boolean') {
+        return value;
+      }
+
+      if (typeof value === 'string') {
+        const normalized = value.trim().toLowerCase();
+        if (normalized === 'true' || normalized === '1') {
+          return true;
+        }
+
+        if (normalized === 'false' || normalized === '0') {
+          return false;
+        }
+      }
+
+      return null;
     };
 
     const enqueuePendingClipboard = (targetDeviceId: string, messageText: string) => {
@@ -176,6 +266,8 @@ export function setupWebSocket(server: Server) {
     };
 
     ws.on('message', async (data) => {
+      markSocketAlive(ws);
+
       try {
         const message = JSON.parse(data.toString()) as any;
         const targetDeviceId = getStringField(message, 'targetDeviceId', 'TargetDeviceId');
@@ -184,6 +276,22 @@ export function setupWebSocket(server: Server) {
           const payload = message?.payload ?? message?.Payload;
           const sourceDeviceId = getStringField(message, 'sourceDeviceId', 'SourceDeviceId') ?? primaryDeviceId;
           const outgoingType = getStringField(message, 'type', 'Type') ?? 'command';
+
+          if (sourceDeviceId && isClipboardSyncState(payload)) {
+            const sourcePlatform = (devicePlatforms.get(sourceDeviceId) ?? '').toLowerCase();
+            const sourceIsMobile = sourcePlatform === 'android' || sourceDeviceId.toLowerCase().startsWith('android-');
+            if (sourceIsMobile) {
+              const enabled = getClipboardSyncStateEnabled(payload);
+              if (enabled === true) {
+                readyMobileDevices.add(sourceDeviceId);
+                broadcastDeviceReady(sourceDeviceId, true);
+                flushPendingClipboard(sourceDeviceId);
+              } else if (enabled === false) {
+                readyMobileDevices.delete(sourceDeviceId);
+                broadcastDeviceReady(sourceDeviceId, false);
+              }
+            }
+          }
 
           const targetWs = connectedDevices.get(targetDeviceId);
           const isClipboardMessage = isClipboardForward(payload);
@@ -309,9 +417,10 @@ export function setupWebSocket(server: Server) {
             await recordConnectionStarted(deviceId);
             broadcastDeviceStatus(deviceId, 'online');
             sendOnlineSnapshotToCurrentSocket(deviceId);
-            readyMobileDevices.delete(deviceId);
-            pendingClipboardByDevice.delete(deviceId);
-            console.log(`[SERVER] mobile connected ${deviceId}`);
+            if (readyMobileDevices.has(deviceId)) {
+              flushPendingClipboard(deviceId);
+            }
+            console.log(`[SERVER] device connected ${deviceId}`);
             
             // Broadcast status change to peers/dashboard
             console.log(`Device ${deviceId} registered via WS`);
@@ -345,14 +454,20 @@ export function setupWebSocket(server: Server) {
     });
 
     ws.on('close', async () => {
-      for (const id of boundDeviceIds) {
-        connectedDevices.delete(id);
-        readyMobileDevices.delete(id);
-        pendingClipboardByDevice.delete(id);
-        devicePlatforms.delete(id);
-      }
+      const actuallyDisconnectedIds: string[] = [];
 
-      if (primaryDeviceId) {
+      boundDeviceIds.forEach((id) => {
+        if (unbindDeviceIdIfOwnedByCurrentSocket(id)) {
+          actuallyDisconnectedIds.push(id);
+          devicePlatforms.delete(id);
+        }
+      });
+
+      const primaryWasDisconnected = !!primaryDeviceId && actuallyDisconnectedIds.includes(primaryDeviceId);
+
+      if (primaryDeviceId && primaryWasDisconnected) {
+        readyMobileDevices.delete(primaryDeviceId);
+
         try {
           await storage.updateDeviceStatus(primaryDeviceId, 'offline');
           await recordConnectionEnded('socket_closed');
@@ -362,6 +477,8 @@ export function setupWebSocket(server: Server) {
           console.error('Failed to update device status on disconnect:', err);
         }
         console.log(`Device ${primaryDeviceId} disconnected`);
+      } else if (primaryDeviceId) {
+        console.log(`[SERVER] stale socket closed for ${primaryDeviceId}; active mapping retained`);
       }
 
       socketPrimaryDeviceIds.delete(ws);
